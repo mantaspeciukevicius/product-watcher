@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from . import store
+from . import store, feedback
 from .domain import Listing
 from .integrations import notify
 
@@ -25,7 +25,7 @@ app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='
 def auth(credentials:HTTPBasicCredentials=Depends(security)):
     user=secrets.compare_digest(credentials.username.encode(),os.getenv('ADMIN_USER','admin').encode())
     password=secrets.compare_digest(credentials.password.encode(),os.getenv('ADMIN_PASSWORD','').encode())
-    if not (user and password): raise HTTPException(401,'Authentication required',headers={'WWW-Authenticate':'Basic realm="NVG Tracker"'})
+    if not (user and password): raise HTTPException(401,'Authentication required',headers={'WWW-Authenticate':'Basic realm="Product Watcher"'})
 
 @app.middleware('http')
 async def local_only(request,call_next):
@@ -60,7 +60,7 @@ def context(request,**extra):
         sources=[dict(r) for r in c.execute('SELECT * FROM sources')]
         counts=dict(c.execute('SELECT matched,COUNT(*) FROM listings GROUP BY matched').fetchall())
     heartbeat=float(store.runtime('heartbeat') or 0)
-    return dict(request=request,s=s,sources=sources,csrf=os.getenv('CSRF_TOKEN'),worker_ok=time.time()-heartbeat<180,heartbeat=heartbeat,last_scan=float(store.runtime('last_scan') or 0),scan_state=store.runtime('scan_state') or 'idle',count=counts.get(1,0),fx_rate=store.runtime('fx_rate'),fx_date=store.runtime('fx_date'),**extra)
+    return dict(request=request,s=s,sources=sources,csrf=os.getenv('CSRF_TOKEN'),worker_ok=time.time()-heartbeat<180,heartbeat=heartbeat,last_scan=float(store.runtime('last_scan') or 0),scan_seconds=store.runtime('last_scan_seconds'),reevaluated=store.runtime('last_reevaluated'),scan_state=store.runtime('scan_state') or 'idle',count=counts.get(1,0),fx_rate=store.runtime('fx_rate'),fx_date=store.runtime('fx_date'),**extra)
 
 @app.get('/health')
 def health():
@@ -76,15 +76,19 @@ def dashboard(request:Request):
 @app.get('/status',response_class=HTMLResponse,dependencies=[Depends(auth)])
 def status(request:Request): return templates.TemplateResponse(request=request,name='status.html',context=context(request))
 @app.get('/listings',response_class=HTMLResponse,dependencies=[Depends(auth)])
-def listing_page(request:Request,view:str='matching',q:str='',source:str=''):
+def listing_page(request:Request,view:str='matching',q:str='',source:str='',sort:str='newest'):
     clauses=[]; args=[]
-    if view=='favorites': clauses=['favorite=1','ignored=0']
+    if view=='irrelevant': clauses=["(irrelevant=1 OR learned_reason!='')"]
+    elif view=='favorites': clauses=['favorite=1','ignored=0']
     elif view=='ignored': clauses=['ignored=1']
     elif view!='all': clauses=['matched=1','ignored=0']
     if q: clauses.append('(title LIKE ? OR description LIKE ?)'); args.extend(['%'+q[:200]+'%']*2)
     if source in ('vinted','skelbiu','allegro'): clauses.append('source=?'); args.append(source)
-    with store.db() as c: listings=c.execute('SELECT * FROM listings'+(' WHERE '+' AND '.join(clauses) if clauses else '')+" ORDER BY favorite DESC, CASE category WHEN 'gen2plus' THEN 0 WHEN 'gen2' THEN 1 WHEN 'analog_unknown' THEN 2 ELSE 3 END, first_seen DESC LIMIT 250",args).fetchall()
-    return templates.TemplateResponse(request=request,name='listings.html',context=context(request,listings=listings,view=view,q=q,source=source,page='listings'))
+    orders={'newest':'first_seen DESC, id DESC','oldest':'first_seen ASC, id ASC','price_low':'total_eur ASC, first_seen DESC, id DESC','priority':"favorite DESC, CASE category WHEN 'gen2plus' THEN 0 WHEN 'gen2' THEN 1 WHEN 'analog_unknown' THEN 2 ELSE 3 END, first_seen DESC, id DESC"}
+    if sort not in orders: sort='newest'
+    with store.db() as c: listings=c.execute('SELECT * FROM listings'+(' WHERE '+' AND '.join(clauses) if clauses else '')+' ORDER BY '+orders[sort]+' LIMIT 250',args).fetchall()
+    return templates.TemplateResponse(request=request,name='listings.html',context=context(request,listings=listings,view=view,q=q,source=source,sort=sort,page='listings'))
+
 @app.get('/listing/{ident}',response_class=HTMLResponse,dependencies=[Depends(auth)])
 def detail(request:Request,ident:int):
     with store.db() as c:
@@ -94,12 +98,16 @@ def detail(request:Request,ident:int):
     return templates.TemplateResponse(request=request,name='detail.html',context=context(request,listing=listing,prices=prices,page='listings'))
 @app.post('/listing/{ident}/{action}',dependencies=[Depends(auth)])
 def action(ident:int,action:str,request:Request):
-    if action not in ('favorite','ignored'): raise HTTPException(404)
+    if action not in ('favorite','ignored','irrelevant'): raise HTTPException(404)
+    settings=store.settings()
     with store.db() as c:
+        c.execute('BEGIN IMMEDIATE')
         if not c.execute('SELECT id FROM listings WHERE id=?',(ident,)).fetchone(): raise HTTPException(404)
         c.execute(f'UPDATE listings SET {action}=1-{action} WHERE id=?',(ident,))
+        if action=='irrelevant': feedback.refresh(c,settings)
         if action=='ignored': c.execute("UPDATE notifications SET state='cancelled' WHERE listing_id=? AND state='pending' AND EXISTS(SELECT 1 FROM listings WHERE id=? AND ignored=1)",(ident,ident))
         listing=c.execute('SELECT * FROM listings WHERE id=?',(ident,)).fetchone()
+    if request.headers.get('hx-request') and action=='irrelevant': return HTMLResponse('',headers={'HX-Refresh':'true'})
     if request.headers.get('hx-request'): return templates.TemplateResponse(request=request,name='card.html',context=context(request,listing=listing))
     return RedirectResponse('/listing/'+str(ident),303)
 @app.post('/scan',dependencies=[Depends(auth)])
@@ -145,9 +153,9 @@ async def save_settings(request:Request):
 @app.post('/notification/test',dependencies=[Depends(auth)])
 async def test_notification():
     s=store.settings()
-    n={'title':'Product Watcher test','body':'Your Product Watcher on your server is ready. Android delivery requires subscribing to this topic.','url':''}
+    n={'title':'Product Watcher test','body':'Your Product Watcher on your self-hosted server is ready. Android delivery requires subscribing to this topic.','url':''}
     with store.db() as c:
-        ident=c.execute("INSERT INTO notifications(event_key,title,body,url,created) VALUES(?,?,?,?,?)",('test:'+secrets.token_hex(12),n['title'],n['body'],'',time.time())).lastrowid
+        ident=c.execute("INSERT INTO notifications(event_key,title,body,url,created,state) VALUES(?,?,?,?,?,'sending')",('test:'+secrets.token_hex(12),n['title'],n['body'],'',time.time())).lastrowid
     try:
         async with httpx.AsyncClient(timeout=15,follow_redirects=False) as client: await notify(client,n,s)
         with store.db() as c: c.execute("UPDATE notifications SET state='sent',sent=? WHERE id=?",(time.time(),ident))

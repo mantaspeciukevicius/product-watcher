@@ -1,12 +1,12 @@
 """Read public, rendered marketplace pages with ordinary Playwright Chromium.
 No private API calls, fingerprint modifications, CAPTCHA solving, proxies or access-block retries.
 """
-import asyncio,json,re,time
+import asyncio,hashlib,json,re,time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode,urlparse,urljoin,quote
 from playwright.async_api import async_playwright,TimeoutError as BrowserTimeout
-from . import store
+from . import store, feedback
 from .domain import Listing,normalized,classify
 from .integrations import SourceError
 
@@ -69,7 +69,7 @@ EXTRACT_JS=r'''(source) => {
   const img=card.querySelector('img');
   const heading=card.querySelector('h2,h3,[data-testid*="title"],.title,.item-title');
   const title=((source==='vinted'?anchor.getAttribute('title'):heading?.innerText)||anchor.getAttribute('title')||anchor.innerText||img?.getAttribute('alt')||'').trim();
-  out.push({url:href,title,text:card.innerText,image:img?.currentSrc||img?.src||'',description:card.querySelector('.description,.item-description,.item-desc,.first-dataline')?.innerText||'',combined:card.querySelector('[data-testid="total-combined-price"]')?.innerText||'',html:card.outerHTML.slice(0,15000)});
+  out.push({url:href,title,text:card.innerText,image:img?.currentSrc||img?.src||'',description:card.querySelector('.description,.item-description,.item-desc,.first-dataline')?.innerText||'',combined:card.querySelector('[data-testid="total-combined-price"]')?.innerText||''});
  }
  return out;
 }'''
@@ -173,10 +173,70 @@ def device_candidate(item):
     text=normalized(item.title+' '+item.description)
     return item.used is not False and classify(item)!='excluded' and bool(re.search(r'naktin\w*|noktow\w*|night[ -]?vision|intensifier|\bpvs[ -]?\d|\bnvg[ -]?(?:30|50)\b',text))
 
+DETAIL_CACHE_TTL = 24 * 60 * 60
+DETAIL_BUDGET = 12
+
+def card_fingerprint(item):
+    """Fingerprint the search card, including its current price and condition."""
+    payload=json.dumps(item.model_dump(),sort_keys=True,separators=(',',':'),ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+def cached_detail(item,cached):
+    """Ignore malformed cache entries rather than interrupting monitoring."""
+    if not cached:return None
+    try:
+        payload=json.loads(cached['data'])
+        detail=Listing.model_validate(payload['detail'])
+        if detail.source!=item.source or detail.external_id!=item.external_id:return None
+        card=payload['card']
+        if not isinstance(card,dict):return None
+        return card,detail
+    except (KeyError,TypeError,ValueError):return None
+
+def merge_detail_metadata(item,cached,previous=None):
+    """Reuse descriptions without replacing prices or conditions from this scan."""
+    parsed=cached_detail(item,cached)
+    changes={}
+    if parsed:
+        card,detail=parsed
+        # A changed title can represent an edited/replaced item; stale descriptions
+        # must not exclude its new device before that item gets a detail request.
+        if card.get('title')==item.title:
+            changes['title']=detail.title
+            if not item.description or item.description==card.get('description',''):
+                changes['description']=detail.description
+            if not item.image:changes['image']=detail.image
+            # Search cards often omit condition. Preserve authoritative detail
+            # condition when that omission is unchanged, including new devices.
+            if item.used is None and card.get('used') is None:changes['used']=detail.used
+    elif previous and previous['title']==item.title and not item.description:
+        changes['description']=previous['description'] or ''
+        if not item.image:changes['image']=previous['image'] or ''
+    return Listing.model_validate({**item.model_dump(),**changes})
+
+def detail_priority(item,cached,now=None):
+    """New or changed cards first, then expired unchanged cards; None is fresh."""
+    if not cached or not cached_detail(item,cached):return 0
+    if cached['fingerprint']!=card_fingerprint(item):return 0
+    try:age=(time.time() if now is None else now)-float(cached['checked'])
+    except (TypeError,ValueError):return 0
+    return None if 0<=age<DETAIL_CACHE_TTL else 1
+
+def save_detail(card,detail,checked=None):
+    payload=json.dumps({'card':card.model_dump(),'detail':detail.model_dump()},separators=(',',':'),ensure_ascii=False)
+    with store.db() as c:
+        c.execute('INSERT INTO detail_cache(source,external_id,fingerprint,checked,data) VALUES(?,?,?,?,?) ON CONFLICT(source,external_id) DO UPDATE SET fingerprint=excluded.fingerprint,checked=excluded.checked,data=excluded.data',
+                  (card.source,card.external_id,card_fingerprint(card),time.time() if checked is None else checked,payload))
+
 async def browser_scan(source,s,rate=1):
     cooldown=float(store.runtime(source+'_browser_blocked_until') or 0)
     if cooldown>time.time():raise BrowserBlocked('Access challenge cooldown; next attempt '+time.strftime('%H:%M',time.localtime(cooldown)))
-    result=BrowserResult(items=[]); found={};parse_errors=[]
+    result=BrowserResult(items=[]); found={};cards={};parse_errors=[]
+    # Read saved metadata and feedback once rather than opening SQLite per card.
+    with store.db() as c:
+        previous={r['external_id']:dict(r) for r in c.execute('SELECT external_id,title,description,image,ignored,irrelevant FROM listings WHERE source=?',(source,))}
+        cached={r['external_id']:dict(r) for r in c.execute('SELECT * FROM detail_cache WHERE source=?',(source,))}
+        learned=feedback.prepare(feedback.examples(c))
     session_dir=store.DATA/'browser';session_dir.mkdir(exist_ok=True)
     state=session_dir/(source+'-cookies.json')
     async with async_playwright() as pw:
@@ -196,26 +256,47 @@ async def browser_scan(source,s,rate=1):
                     if not any(x in normalized(text) for x in empty_markers):
                         parse_errors.append(keyword)
                         store.log(source,'Search '+keyword+': no recognized cards or empty-state','warning')
-                for item in items:
-                    if device_candidate(item) and item.price<(s['max_price']*rate if item.currency=='PLN' else s['max_price']):found[item.external_id]=item
+                for card in items:
+                    item=merge_detail_metadata(card,cached.get(card.external_id),previous.get(card.external_id))
+                    raw_allowed=card.used is not False and classify(card)!='excluded'
+                    due=detail_priority(card,cached.get(card.external_id)) is not None
+                    # Description/condition-only edits are invisible on cards:
+                    # once details expire, an eligible raw card must get a recheck
+                    # even if its previous description excluded it.
+                    candidate=device_candidate(item) or (due and device_candidate(card))
+                    if raw_allowed and candidate and card.price<(s['max_price']*rate if card.currency=='PLN' else s['max_price']):
+                        found[item.external_id]=item;cards[item.external_id]=card
                 # First results page only: explicitly partial coverage, not an exhaustive scan.
                 await asyncio.sleep(2)
-            budget=12
-            for ident,item in sorted(found.items(),key=lambda pair:0 if classify(pair[1]) in s['categories'] else 1):
-                if classify(item)=='excluded' or item.used is False:continue
-                if not re.search(r'naktin\w*|noktow\w*|night[ -]?vision|intensifier|\bpvs[ -]?\d|\bnvg[ -]?(?:30|50)\b',normalized(item.title+' '+item.description)):continue
-                if result.details>=budget:result.partial=True;break
-                if not any(normalized(k) in normalized(item.title) for k in s['keywords']):continue
+            now=time.time();plan=[];reused=0;skipped=0;attempts=0
+            keyword_text=[normalized(k) for k in s['keywords']]
+            for ident,item in found.items():
+                known=previous.get(ident)
+                if (known and (known['ignored'] or known['irrelevant'])) or feedback.reason(item,learned):
+                    skipped+=1;continue
+                priority=detail_priority(cards[ident],cached.get(ident),now)
+                recheck=priority is not None and device_candidate(cards[ident])
+                if (classify(item)=='excluded' or item.used is False) and not recheck:continue
+                title_text=normalized(item.title+' '+cards[ident].title)
+                if not any(k in title_text for k in keyword_text):continue
+                if priority is None:reused+=1;continue
+                plan.append((priority,0 if classify(item) in s['categories'] else 1,ident))
+            for _,_,ident in sorted(plan,key=lambda entry:entry[:2]):
+                item=found[ident]
+                if attempts>=DETAIL_BUDGET:result.partial=True;break
+                attempts+=1
                 try:
-                    with store.db() as c:c.execute("UPDATE sources SET error=? WHERE name=?",(f'Reading device descriptions: {result.details+1}/{budget}',source))
-                    found[ident]=await enrich(page,item);result.details+=1
+                    with store.db() as c:c.execute("UPDATE sources SET error=? WHERE name=?",(f'Reading device descriptions: {attempts}/{DETAIL_BUDGET}',source))
+                    detailed=await enrich(page,cards[ident])
+                    found[ident]=detailed;result.details+=1
+                    save_detail(cards[ident],detailed)
                 except BrowserBlocked as e:
                     e.items=list(found.values());raise
                 except (BrowserTimeout,SourceError,ValueError):result.partial=True
                 await asyncio.sleep(2)
             if parse_errors and not found:raise BrowserParseError('No recognized listings/empty states for searches: '+', '.join(parse_errors))
             result.items=list(found.values())
-            result.note=f'Browser checked {result.searches} searches; read {len(found)} unique listings and {result.details} detail pages. First results page per keyword; shipping/fees only if provided. Coverage is partial.'
+            result.note=f'Browser checked {result.searches} searches; read {len(found)} unique listings and {result.details} detail pages ({attempts} attempted, {reused} cached, {skipped} skipped by feedback/ignore). First results page per keyword; shipping/fees only if provided. Coverage is partial.'
             if parse_errors:result.note+=' Unverified searches: '+', '.join(parse_errors)+'.'
             result.partial=True
             await context.storage_state(path=str(state))
