@@ -1,0 +1,7 @@
+[
+ {"source":"vinted","external_id":"mock-1","title":"Naktinio matymo monokuliaras Gen 2+","description":"Naudotas analoginis prietaisas","url":"https://www.vinted.lt/items/mock-1","price":280,"currency":"EUR","shipping":5,"fees":9,"used":true},
+ {"source":"skelbiu","external_id":"mock-2","title":"Night vision Gen 1 monocular","url":"https://www.skelbiu.lt/skelbimai/mock-2.html","price":90,"currency":"EUR","used":true},
+ {"source":"allegro","external_id":"mock-3","title":"Noktowizor generacji 2","url":"https://allegro.pl/oferta/mock-3","price":1300,"currency":"PLN","shipping":30,"fees":0,"used":true},
+ {"source":"vinted","external_id":"mock-4","title":"Digital NVG30 night vision","url":"https://www.vinted.lt/items/mock-4","price":180,"currency":"EUR","used":true},
+ {"source":"vinted","external_id":"mock-5","title":"Thermal night vision Gen 2","url":"https://www.vinted.lt/items/mock-5","price":200,"currency":"EUR","used":true}
+]

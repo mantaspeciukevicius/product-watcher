@@ -1,0 +1,2 @@
+document.addEventListener('htmx:configRequest',function(e){e.detail.headers['X-CSRF-Token']=document.querySelector('meta[name="csrf-token"]').content;});
+document.addEventListener('htmx:responseError',function(e){const t=e.detail.target;const p=document.createElement('p');p.className='bad';let message='Request failed ('+e.detail.xhr.status+')';try{message=JSON.parse(e.detail.xhr.responseText).detail||message;}catch{}p.textContent=message;t.appendChild(p);});

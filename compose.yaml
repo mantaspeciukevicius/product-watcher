@@ -1,0 +1,48 @@
+name: nvg-tracker
+x-common: &common
+  build: .
+  image: nvg-tracker:local
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATA_DIR: /data
+  volumes:
+    - ./data:/data
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "5m"
+      max-file: "3"
+services:
+  web:
+    <<: *common
+    ports:
+      - "${LAN_IP}:${PORT}:8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  worker:
+    <<: *common
+    environment:
+      DATA_DIR: /data
+      XDG_CONFIG_HOME: /tmp/chromium-config
+      XDG_CACHE_HOME: /tmp/chromium-cache
+    shm_size: 256mb
+    mem_limit: 1536m
+    cpus: 1.5
+    tmpfs:
+      - /tmp:size=512m
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app import store; import time; assert time.time()-float(store.runtime('heartbeat') or 0)<180"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
