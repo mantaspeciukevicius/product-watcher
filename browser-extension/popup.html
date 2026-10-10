@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Send to Tracker</title><link rel="stylesheet" href="popup.css"></head>
+<body>
+  <header><span class="eyebrow">PRODUCT WATCHER</span><h1>Send to your tracker</h1><p>Read the marketplace page you opened, review the results, and send your selection.</p></header>
+  <details id="connection" open>
+    <summary>Connect to your home tracker</summary>
+    <label>Dashboard URL<input id="dashboard-url" type="url" placeholder="http://YOUR_LAN_IP:8765" autocomplete="off" spellcheck="false"></label>
+    <label>Import token<input id="import-token" type="password" autocomplete="off" spellcheck="false" placeholder="From Browser Import in your dashboard"></label>
+    <button id="connect" class="secondary">Connect / Test connection</button>
+    <p class="hint">Only this local server receives your selected listings. The token stays in this extension’s local storage.</p>
+  </details>
+  <div class="toolbar"><button id="read">Read this page</button><button id="select-all" class="secondary" hidden>Select all</button></div>
+  <p id="status" role="status" aria-live="polite">Open a Vinted, Skelbiu or Allegro search or listing page.</p>
+  <div id="listings"></div>
+  <button id="send" hidden>Send selected listings</button>
+  <p class="hint">Only currently rendered listings are read. Scroll the marketplace page and read it again to include more. No background marketplace scans.</p>
+  <script src="config.js"></script><script src="popup.js"></script>
+</body>
+</html>

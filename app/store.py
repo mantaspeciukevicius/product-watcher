@@ -1,7 +1,7 @@
 import os, json, sqlite3, contextlib, time
 from pathlib import Path
 DATA = Path(os.getenv('DATA_DIR', '/data'))
-DEFAULTS = dict(max_price=400, interval=15, paused=False, keywords=['naktinio matymo','naktinis matymas','noktowizor','noktowizja','night vision','gen 2','gen 2+','NVG30','NVG50'], categories=['gen2','gen2plus','analog_unknown','nvg30','nvg50'], price_drop=10, ntfy_enabled=True, ntfy_url='https://ntfy.sh', ntfy_topic=os.getenv('NTFY_TOPIC',''), ntfy_token='', allegro_client_id='', allegro_client_secret='', allegro_access_token='', allegro_enabled=True, vinted_enabled=True, skelbiu_enabled=True)
+DEFAULTS = dict(max_price=400, interval=15, browser_delay=10, paused=False, keywords=['naktinio matymo','naktinis matymas','noktowizor','noktowizja','night vision','gen 2','gen 2+','NVG30','NVG50'], categories=['gen2','gen2plus','analog_unknown','nvg30','nvg50'], price_drop=10, ntfy_enabled=True, ntfy_url='https://ntfy.sh', ntfy_topic=os.getenv('NTFY_TOPIC',''), ntfy_token='', allegro_client_id='', allegro_client_secret='', allegro_access_token='', allegro_enabled=True, vinted_enabled=True, skelbiu_enabled=True)
 @contextlib.contextmanager
 def db():
     c = sqlite3.connect(DATA/'tracker.sqlite3', timeout=20)

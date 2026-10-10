@@ -2,3 +2,5 @@
 data/
 __pycache__/
 .pytest_cache/
+browser-extension/paired-config.json
+product-watcher-extension.zip

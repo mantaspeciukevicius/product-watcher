@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Product Watcher — Send to Tracker",
+  "version": "1.0.0",
+  "description": "Review listings on marketplace pages you open, then send selected items to your local tracker.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {"service_worker": "background.js"},
+  "action": {"default_title": "Send listings to your tracker", "default_popup": "popup.html"},
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'"}
+}

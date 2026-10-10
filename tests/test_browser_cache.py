@@ -128,6 +128,23 @@ def test_scan_reuses_cache_and_refreshes_changed_price(fake_browser, monkeypatch
     assert calls==['1','1'] and third.items[0].price==250
 
 
+@pytest.mark.parametrize('known_condition',[False,True])
+def test_imported_condition_survives_cards_without_detail_budget(fake_browser,monkeypatch,known_condition):
+    known=card(used=known_condition)
+    ingest(known,1,store.settings())
+    cards=[card(used=None)];calls=[]
+    setup_scan(monkeypatch,cards,calls)
+    s={**settings(),'_detail_budget':0}
+    result=asyncio.run(browser.browser_scan('vinted',s))
+    assert result.items[0].used is known_condition and not calls
+    # A condition explicitly shown on the current card always wins.
+    cards[0]=card(used=not known_condition)
+    # Newly marked new-condition cards are excluded at collection, as intended.
+    result=asyncio.run(browser.browser_scan('vinted',s))
+    if cards[0].used:assert result.items[0].used is True
+    else:assert not result.items
+
+
 def test_scan_refreshes_expired_detail(fake_browser, monkeypatch):
     cards=[card()];calls=[]
     browser.save_detail(cards[0], detail(cards[0]), checked=time.time()-browser.DETAIL_CACHE_TTL-1)

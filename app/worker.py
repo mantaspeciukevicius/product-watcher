@@ -1,14 +1,18 @@
 import asyncio, json, time, hashlib
 from contextlib import suppress
 import httpx
-from . import store, feedback
+from . import store, feedback, pacing
 from .domain import Listing, classify, matches, total_eur
 from .integrations import allegro, exchange_rate, notify, SourceError
 from .browser_sources import browser_scan, BrowserBlocked, BrowserParseError
 
-def _ingest(c,item,rate,s,learned,touch=True,allow_events=True):
-    category=classify(item); total=total_eur(item,rate); match=matches(item,category,total,s); now=time.time()
+def _ingest(c,item,rate,s,learned,touch=True,allow_events=True,preserve_metadata=False):
     old=c.execute('SELECT * FROM listings WHERE source=? AND external_id=?',(item.source,item.external_id)).fetchone()
+    if preserve_metadata and old and old['title']==item.title:
+        metadata={key:old[key] for key in ('description','image') if not getattr(item,key) and old[key]}
+        if item.used is None and old['used'] is not None:metadata['used']=bool(old['used'])
+        if metadata:item=Listing.model_validate({**item.model_dump(),**metadata})
+    category=classify(item); total=total_eur(item,rate); match=matches(item,category,total,s); now=time.time()
     why=feedback.reason(item,learned)
     match=match and not why
     values=(item.title,item.description,item.url,item.image,item.currency,item.price,item.shipping,item.fees,total,category,item.used,now,int(match),rate,why)
@@ -27,7 +31,7 @@ def _ingest(c,item,rate,s,learned,touch=True,allow_events=True):
         elif old['total_eur']>0 and total<=old['total_eur']*(1-s['price_drop']/100): event='drop:'+str(total)
     if event and allow_events and s['ntfy_enabled']:
         event_key=f'{ident}:{event}'
-        title=('Price drop: ' if event.startswith('drop:') else 'New product match: ')+item.title[:120]
+        title=('Price drop: ' if event.startswith('drop:') else 'New NVG deal: ')+item.title[:120]
         extra=' + unknown shipping/fees' if item.shipping is None or item.fees is None else ' incl. known shipping/fees'
         body=f'{item.title}\n€{total:.2f}{extra} · {item.source}\n{item.url}'
         c.execute('INSERT OR IGNORE INTO notifications(listing_id,event_key,title,body,url,created) VALUES(?,?,?,?,?,?)',(ident,event_key,title,body,item.url,now))
@@ -40,14 +44,14 @@ def ingest(item,rate,s,touch=True):
         c.execute('BEGIN IMMEDIATE')
         return _ingest(c,item,rate,s,feedback.prepare(feedback.examples(c)),touch)
 
-def ingest_many(items,rate,s,touch=True,allow_events=True):
+def ingest_many(items,rate,s,touch=True,allow_events=True,preserve_metadata=False):
     """Short transactions keep history/alerts atomic while letting feedback writes through."""
     items=list(items); identifiers=[]
     for start in range(0,len(items),50):
         with store.db() as c:
             c.execute('BEGIN IMMEDIATE')
             learned=feedback.prepare(feedback.examples(c))
-            for item in items[start:start+50]: identifiers.append(_ingest(c,item,rate,s,learned,touch,allow_events))
+            for item in items[start:start+50]: identifiers.append(_ingest(c,item,rate,s,learned,touch,allow_events,preserve_metadata))
     return identifiers
 
 def reevaluate_history(s,rate):
@@ -92,57 +96,109 @@ def import_file(path,s,rate):
     if not isinstance(raw,list) or len(raw)>1000: raise ValueError('Expected JSON array with at most 1000 listings')
     items=[Listing.model_validate(x) for x in raw]
     enabled=[item for item in items if s[item.source+'_enabled']]
-    ingest_many(enabled,rate,s)
+    ingest_many(enabled,rate,s,preserve_metadata=True)
     return len(enabled)
 
-async def scan(client):
-    s=store.settings(); store.runtime('scan_started',time.time()); store.runtime('scan_state','running')
-    try:
-        rate=await exchange_rate(client)
-    except SourceError as e:
-        rate=None; store.log('currency',str(e),'error')
+async def process_imports(client,s=None,rate=None,rate_checked=False):
+    """Imports work while sources are paused/blocked; they never trigger browser searches."""
+    paths=sorted((store.DATA/'inbox').glob('*.json'))
+    if not paths:
+        # The importer polls every five seconds; an empty inbox needs no
+        # database writes unless a previous request/count must be cleared.
+        for key in ('import_pending','import_requested'):
+            if store.runtime(key) not in (None,'0'):store.runtime(key,0)
+        return 0
+    s=s or store.settings(); imported=0
+    for path in paths:
+        try:
+            raw=json.loads(path.read_text())
+            if not isinstance(raw,list) or len(raw)>1000: raise ValueError('Expected an array of at most 1000 listings')
+            items=[Listing.model_validate(x) for x in raw]
+            enabled=[item for item in items if s[item.source+'_enabled']]
+            needs_rate=any(item.currency=='PLN' for item in enabled)
+            if needs_rate and not rate_checked:
+                try: rate=await exchange_rate(client)
+                except SourceError: rate=None
+                rate_checked=True
+            if needs_rate and rate is None:
+                # Log once per file, preserving it for the next valid conversion.
+                wait_marker=path.with_suffix('.waiting')
+                if not wait_marker.exists():
+                    store.log('import',path.name+': waiting for PLN rate','warning');wait_marker.touch()
+                continue
+            ingest_many(enabled,rate or 1,store.settings(),preserve_metadata=True)
+            imported+=len(enabled)
+            path.rename(path.with_suffix('.processed'))
+            path.with_suffix('.waiting').unlink(missing_ok=True)
+            store.log('import',f'Imported {len(enabled)} records from {path.name}')
+        except Exception as e:
+            if path.exists():path.rename(path.with_suffix('.failed'))
+            path.with_suffix('.waiting').unlink(missing_ok=True)
+            store.log('import',path.name+': invalid import ('+type(e).__name__+')','error')
+    pending=len(list((store.DATA/'inbox').glob('*.json')))
+    if store.runtime('import_pending')!=str(pending):store.runtime('import_pending',pending)
+    if store.runtime('import_requested') not in (None,'0'):store.runtime('import_requested','0')
+    if imported:
+        store.runtime('import_last_count',imported);store.runtime('import_last_time',time.time())
+    return imported
+
+async def scan(client,force=False,handle_imports=True,plan=None):
+    s=store.settings()
     for source in ('vinted','skelbiu','allegro'):
         if not s[source+'_enabled']:
-            set_source(source,'disabled'); continue
-        if source=='allegro' and not rate:
-            set_source(source,'error','PLN conversion unavailable; scan deferred'); continue
+            with store.db() as c:c.execute("UPDATE sources SET status='disabled',error='' WHERE name=? AND status!='disabled'",(source,))
+    if plan is None:plan=pacing.due_sources(s,force=force)
+    rate=None
+    if plan:
+        store.runtime('scan_started',time.time());store.runtime('scan_state','running')
+        try: rate=await exchange_rate(client)
+        except SourceError as e: store.log('currency',str(e),'error')
+    for source,keyword in plan:
+        attempts=0
         try:
-            set_source(source,'checking','Starting source check')
+            current=store.settings()
+            if not current[source+'_enabled']:
+                set_source(source,'disabled');continue
+            if (current['paused'] and not force) or keyword not in pacing.keywords(current):continue
+            if source=='allegro' and not rate:
+                set_source(source,'error','PLN conversion unavailable; check deferred');continue
+            subset={**s,'keywords':[keyword],'_detail_budget':pacing.detail_budget(source,s)}
+            set_source(source,'checking','Checking keyword: '+keyword)
             use_api=source=='allegro' and (s['allegro_access_token'] or (s['allegro_client_id'] and s['allegro_client_secret']))
             if use_api:
-                items,truncated=await allegro(client,s,rate)
-                message='Official API scan: '+str(len(items))+' offers'+('; API pagination limit reached' if truncated else '')
+                items,truncated=await allegro(client,subset,rate)
+                message='Official API keyword '+keyword+': '+str(len(items))+' offers'+('; pagination limit reached' if truncated else '')
             else:
-                result=await browser_scan(source,s,rate or 1)
+                result=await browser_scan(source,subset,rate or 1)
                 items=result.items;truncated=result.partial;message=result.note
+                attempts=result.attempts
             ingest_many(items,rate or 1,store.settings())
-            set_source(source,'limited' if truncated else 'working',message,True)
-            store.log(source,message)
+            set_source(source,'limited' if truncated else 'working',message,True);store.log(source,message)
         except BrowserBlocked as e:
+            attempts=e.attempts
             ingest_many(e.items,rate or 1,store.settings())
-            set_source(source,'blocked',str(e)+(' · Saved '+str(len(e.items))+' listings read before the block' if e.items else ''),bool(e.items));store.log(source,str(e),'warning')
+            set_source(source,'blocked',str(e)+(' · Saved '+str(len(e.items))+' records before the block' if e.items else ''),bool(e.items));store.log(source,str(e),'warning')
         except BrowserParseError as e:
             set_source(source,'parser_error',str(e));store.log(source,str(e),'error')
         except SourceError as e:
             set_source(source,'needs_access' if use_api else 'error',str(e));store.log(source,str(e),'warning')
         except Exception as e:
-            message='Scan failed: '+type(e).__name__+': '+str(e)[:250];set_source(source,'error',message);store.log(source,message,'error')
-    for path in sorted((store.DATA/'inbox').glob('*.json')):
-        try:
-            raw=json.loads(path.read_text())
-            if rate is None and any(x.get('currency','EUR').upper()=='PLN' for x in raw):
-                store.log('import',path.name+': waiting for PLN rate','warning'); continue
-            count=import_file(path,s,rate or 1)
-            path.rename(path.with_suffix('.processed'))
-            store.log('import',f'Imported {count} records from {path.name}')
-        except Exception as e:
-            path.rename(path.with_suffix('.failed')); store.log('import',path.name+': invalid import ('+type(e).__name__+')','error')
-    # Only changed filters/rates require a full-history pass.
-    reevaluated=reevaluate_history(store.settings(),rate)
-    store.runtime('last_reevaluated',reevaluated)
-    store.runtime('last_scan_seconds',round(time.time()-float(store.runtime('scan_started')),2))
-    store.runtime('last_scan',time.time()); store.runtime('scan_state','idle')
-    await deliver(client)
+            message='Check failed: '+type(e).__name__+': '+str(e)[:250];set_source(source,'error',message);store.log(source,message,'error')
+        finally:pacing.complete(source,s,attempts=attempts)
+    if handle_imports:await process_imports(client,s,rate,rate_checked=bool(plan))
+    if plan:
+        reevaluated=reevaluate_history(store.settings(),rate)
+        store.runtime('last_reevaluated',reevaluated)
+        store.runtime('last_scan_seconds',round(time.time()-float(store.runtime('scan_started')),2))
+        store.runtime('last_scan',time.time());store.runtime('scan_state','idle')
+        await deliver(client)
+    return bool(plan)
+
+async def import_loop(client):
+    while True:
+        try:await process_imports(client)
+        except Exception as e:store.log('import','Import cycle failed: '+type(e).__name__,'error')
+        await asyncio.sleep(5)
 
 async def heartbeat(interval=15):
     while True:
@@ -150,23 +206,34 @@ async def heartbeat(interval=15):
         await asyncio.sleep(interval)
 
 async def run():
-    store.init(); store.log('worker','Monitoring worker started')
-    store.runtime('scan_state','idle')
-    # Recreating a worker does not trigger an unnecessary marketplace scan.
-    last=float(store.runtime('last_scan') or 0)
+    store.init();store.log('worker','Monitoring worker started');store.runtime('scan_state','idle')
     pulse=asyncio.create_task(heartbeat())
     try:
         async with httpx.AsyncClient(timeout=20,follow_redirects=False) as client:
-            while True:
-                try:
-                    s=store.settings(); requested=store.runtime('scan_requested')
-                    if requested=='1' or (not s['paused'] and time.time()-last>=s['interval']*60):
-                        store.runtime('scan_requested','0'); await scan(client); last=time.time()
-                    await deliver(client)
-                except Exception as e:
-                    store.runtime('scan_state','error'); store.log('worker','Worker cycle failed: '+type(e).__name__,'error'); last=time.time()
-                await asyncio.sleep(5)
+            importer=asyncio.create_task(import_loop(client))
+            try:
+                while True:
+                    try:
+                        s=store.settings();requested=store.runtime('scan_requested')=='1'
+                        if requested:store.runtime('scan_requested','0')
+                        if requested or not s['paused']:
+                            plan=pacing.due_sources(s,force=requested)
+                            if plan:await scan(client,force=requested,handle_imports=False,plan=plan)
+                        if requested:
+                            for source in ('vinted','skelbiu','allegro'):
+                                if not s[source+'_enabled']:set_source(source,'disabled')
+                            checked=float(store.runtime('fx_checked') or 0)
+                            cached=store.runtime('fx_rate')
+                            rate=float(cached) if cached and time.time()-checked<7*86400 else None
+                            reevaluate_history(store.settings(),rate)
+                        await deliver(client)
+                    except Exception as e:
+                        store.runtime('scan_state','error');store.log('worker','Worker cycle failed: '+type(e).__name__,'error')
+                    await asyncio.sleep(5)
+            finally:
+                importer.cancel()
+                with suppress(asyncio.CancelledError):await importer
     finally:
         pulse.cancel()
-        with suppress(asyncio.CancelledError): await pulse
-if __name__=='__main__': asyncio.run(run())
+        with suppress(asyncio.CancelledError):await pulse
+if __name__=='__main__':asyncio.run(run())

@@ -11,7 +11,9 @@ The current deployment is configured for used optical equipment. Category rules 
 - Tracks used analog Gen 2 / Gen 2+ devices, unknown-generation analog candidates, and NVG30 / NVG50.
 - Supports Lithuanian, Polish and English keywords. Excludes Gen 1, thermal, FPV and ordinary digital devices by default.
 - Compares known total costs against a configurable EUR budget, including available shipping and fees; converts PLN using Poland’s NBP API.
-- Keeps favorites, ignored items, listing history and price changes in SQLite.
+- Keeps favorites, ignored and irrelevant items, listing history and price changes in SQLite.
+- Rotates one search keyword per source at a time, caches detail reads, and backs off after repeated access blocks.
+- Imports reviewed listings from user-opened marketplace pages with a PC browser extension or the responsive dashboard form.
 - Sends ntfy alerts for new matches and significant price drops, with a persistent notification outbox and retries.
 - Provides source toggles, editable filters, Scan now, Pause/Resume, status and error logs in a responsive dark interface.
 
@@ -27,7 +29,7 @@ Screenshots use synthetic data in an isolated demo instance. They illustrate the
 | PLN conversion | Official NBP API | Live retrieval verified |
 | Android alerts | ntfy publication | Publication and retrieval verified; phone receipt depends on subscription |
 
-Access can change. Challenges and HTTP 401/403/429 stop collection and trigger a one-hour cooldown. No CAPTCHA solving, stealth modifications, proxy rotation or access-control bypass. Browser monitoring is not represented as marketplace-approved. Each cycle checks the first rendered page per keyword and at most twelve attempted detail pages per source. Manual JSON imports remain available. See [operations and limitations](docs/OPERATIONS.md).
+Access can change. Challenges and HTTP 401/403/429 stop collection; repeated blocks wait 1, 2, 4, 8, 16 and then 24 hours, respecting a longer Retry-After deadline. No CAPTCHA solving, stealth modifications, proxy rotation or access-control bypass. Browser monitoring is not represented as marketplace-approved. Each source checks one keyword per step, with at least sixty seconds between steps, at most two fresh detail attempts per step, and at most twelve across a full keyword rotation. Scan now respects these bounds and access backoff. Browser and form/JSON imports run independently, even while automated checks are paused or blocked. Existing API code does not imply new approved marketplace API access. See [operations and limitations](docs/OPERATIONS.md).
 
 ## Run it
 
@@ -46,15 +48,25 @@ Open `http://YOUR_LAN_IP:8765`. Sign in as `admin` using the generated `ADMIN_PA
 
 ## Daily use
 
-1. Open Settings, enable desired sources and review keywords/categories. Budget defaults to €400 and interval to 15 minutes.
+1. Open Settings, enable desired sources and review keywords/categories. Budget defaults to €400 and a full keyword rotation to 15 minutes. Existing saved intervals are preserved. Browser request spacing defaults to ten seconds and is adjustable from three to sixty seconds.
 2. Choose Scan now. The source panel shows progress, limited coverage, cooldowns or errors.
 3. Review Listings. Favorite candidates, ignore individual items or mark false matches Irrelevant, and open a listing’s price history.
 4. Install [ntfy for Android](https://ntfy.sh/), subscribe using the server/topic shown in Settings, allow notifications and background delivery, then use Test Notification.
-5. Use Pause to stop scheduled collection. Queued notification delivery can continue. Scan now still works while paused.
+5. Use Pause to stop scheduled marketplace checks. Imports and queued notifications continue. Scan now checks only the next eligible keyword per source and still obeys spacing and backoff.
 
 Unknown shipping is labeled unknown. Text classification does not verify a seller’s device generation or condition. A price is eligible only when its known total is strictly below the budget.
 
 ![Mobile dashboard](docs/screenshots/mobile.png)
+
+## Import from your normal browser
+
+For Chrome, Edge or Brave on a PC, open **Import listings** in the authenticated dashboard and download the paired extension ZIP. Extract it into a permanent private folder, open `chrome://extensions` or `edge://extensions`, enable **Developer mode**, and choose **Load unpacked** with the folder containing `manifest.json`. Pin **Product Watcher — Send to Tracker**, then press **Connect / Test connection** in its popup and allow access to your local tracker.
+
+Open a marketplace page normally and press **Read this page**. The extension previews currently rendered search cards or the current item detail page. Review titles, prices, condition and costs, select entries, and send them. Detail pages often provide better classification data. Your normal filters, feedback, price history and alert rules apply; no extra marketplace search is triggered.
+
+Imports are processed about every five seconds, including while automatic monitoring is paused, a source is blocked or another check is running. PLN batches wait for a valid rate. Disabled-source entries are skipped. The paired ZIP contains the private import token: keep it private. Generic source has no token, marketplace sessions are not copied, and page-reading code never receives the token. The extension performs no unattended marketplace navigation or access-challenge interaction. Normal Android Chrome does not support this desktop extension; the responsive import form remains available on Android.
+
+See the [extension guide](browser-extension/README.md) for installation, permissions and troubleshooting. Search-card imports with an unchanged title preserve a saved description, photo and known condition when the new preview omits them. Current price, shipping and fees remain authoritative, including unknown costs. The roughly five-second inbox poll is not a phone-delivery guarantee: notification delivery can wait for an active marketplace check to finish.
 
 ## Architecture
 
@@ -81,7 +93,7 @@ docker run --rm --network none --read-only --tmpfs /tmp:size=512m \
   python -m pytest -q -p no:cacheprovider /srv/tests
 ```
 
-73 automated tests cover multilingual classification, costs, deduplication/retries, persistence, access controls, imports, mocked API responses and browser parsing/challenge detection. No live marketplace credentials are needed. See [mock data](tests/mock_marketplaces.json) and [operational guide](docs/OPERATIONS.md) for imports, backups, troubleshooting and known limits.
+153 automated tests cover multilingual classification, costs, deduplication/retries, persistence, access controls, imports, mocked API responses and browser parsing/challenge detection. No live marketplace credentials are needed. See [mock data](tests/mock_marketplaces.json) and [operational guide](docs/OPERATIONS.md) for imports, backups, troubleshooting and known limits.
 
 More interface views: [screenshot gallery](docs/SCREENSHOTS.md).
 
@@ -93,6 +105,6 @@ The engineering focus is a complete small deployment: durable background jobs, c
 
 Sort listings by discovery date (newest/oldest), price or category priority. Discovery means when the tracker first saved the item. Marking a false match Irrelevant teaches reversible, conservative title/camera-family rules; Ignore only suppresses the individual item. Review learned exclusions and undo examples in the Irrelevant tab.
 
-Unchanged detail reads are cached for 24 hours, with new or changed search cards prioritized and current card prices/fees/condition preserved. Description-only edits may take up to 24 hours to appear. Ignored and irrelevant items skip detail requests. History is rechecked only when matching filters or exchange rates change; ingestion batches at most 50 items per transaction. Prepared feedback snapshots avoid repeatedly normalizing negative examples. The worker maintains a separate heartbeat during scans, honors its saved schedule after restarts, and reports scan duration. Browser request pacing and access-block cooldowns still apply.
+Unchanged detail reads are cached for 24 hours, with new or changed search cards prioritized and current card prices/fees/condition preserved. Description-only edits may take up to 24 hours to appear. Ignored and irrelevant items skip detail requests. History is rechecked only when matching filters or exchange rates change; ingestion batches at most 50 items per transaction. Prepared feedback snapshots avoid repeatedly normalizing negative examples. The worker maintains a separate heartbeat during scans, honors its saved schedule after restarts, and reports scan duration. Persisted per-source keyword scheduling, request pacing and escalating access-block waits still apply after restarts.
 
 Cached exclusions and new-condition details are refreshed after expiry when current search cards remain eligible. A cached known condition is reused when unchanged cards omit condition; explicit current card conditions always take precedence.
