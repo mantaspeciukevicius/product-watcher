@@ -17,7 +17,7 @@ async def lifespan(app):
     store.init()
     if not os.getenv('ADMIN_PASSWORD'): raise RuntimeError('ADMIN_PASSWORD must be set')
     yield
-app=FastAPI(title='NVG Deal Tracker',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+app=FastAPI(title='Product Watcher',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
 security=HTTPBasic()
 templates=Jinja2Templates(directory=str(Path(__file__).parent/'templates'))
 app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='static')
@@ -145,7 +145,7 @@ async def save_settings(request:Request):
 @app.post('/notification/test',dependencies=[Depends(auth)])
 async def test_notification():
     s=store.settings()
-    n={'title':'NVG Tracker test','body':'Your NVG Deal Tracker on your server is ready. Android delivery requires subscribing to this topic.','url':''}
+    n={'title':'Product Watcher test','body':'Your Product Watcher on your server is ready. Android delivery requires subscribing to this topic.','url':''}
     with store.db() as c:
         ident=c.execute("INSERT INTO notifications(event_key,title,body,url,created) VALUES(?,?,?,?,?)",('test:'+secrets.token_hex(12),n['title'],n['body'],'',time.time())).lastrowid
     try:

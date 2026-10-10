@@ -1,10 +1,12 @@
-# NVG Deal Tracker
+# Product Watcher
 
-A self-hosted night-vision deal dashboard that turns marketplace listings into a searchable history and Android alerts. Built for an Ubuntu home server with Python, FastAPI, HTMX, SQLite, Playwright, Docker Compose and ntfy.
+A self-hosted product monitoring dashboard that turns marketplace listings into searchable price history and Android alerts. Built for an Ubuntu home server with Python, FastAPI, HTMX, SQLite, Playwright, Docker Compose and ntfy.
 
 ![Dashboard with synthetic demonstration listings](docs/screenshots/dashboard.png)
 
 ## What it does
+
+The current deployment is configured for used optical equipment. Category rules are specialized to that configuration; adapters and saved keywords do not make it a universal product classifier. The monitoring, price history, favorites, imports and notification infrastructure can be reused for other product categories after adapting the classification rules.
 
 - Tracks used analog Gen 2 / Gen 2+ devices, unknown-generation analog candidates, and NVG30 / NVG50.
 - Supports Lithuanian, Polish and English keywords. Excludes Gen 1, thermal, FPV and ordinary digital devices by default.
@@ -32,8 +34,8 @@ Access can change. Challenges and HTTP 401/403/429 stop collection and trigger a
 Requires Docker Engine with Compose, a Linux host and a trusted local network.
 
 ```sh
-git clone https://github.com/mantaspeciukevicius/nvg-deal-tracker.git
-cd nvg-deal-tracker
+git clone https://github.com/mantaspeciukevicius/product-watcher.git
+cd product-watcher
 python3 scripts/configure.py
 # Edit .env: LAN_IP and ALLOWED_CIDRS must match your network.
 mkdir -p data && chmod 700 data
@@ -75,7 +77,7 @@ docker compose build
 docker run --rm --network none --read-only --tmpfs /tmp:size=512m \
   --cap-drop ALL --security-opt no-new-privileges \
   -e DATA_DIR=/tmp/test-data -e XDG_CONFIG_HOME=/tmp/chromium-config \
-  -e XDG_CACHE_HOME=/tmp/chromium-cache nvg-tracker:local \
+  -e XDG_CACHE_HOME=/tmp/chromium-cache product-watcher:local \
   python -m pytest -q -p no:cacheprovider /srv/tests
 ```
 

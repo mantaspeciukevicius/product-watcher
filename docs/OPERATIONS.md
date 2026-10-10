@@ -1,6 +1,6 @@
-# NVG Deal Tracker
+# Product Watcher
 
-Deployed on an Ubuntu server at http://YOUR_LAN_IP:8765. The complete application lives in `/opt/containers/nvg-tracker`.
+Deployed on an Ubuntu server at http://YOUR_LAN_IP:8765. The complete application lives in `/opt/containers/product-watcher`.
 
 ## Access and Android
 
@@ -43,7 +43,7 @@ Example schema (example only, not live data):
 ## Operations
 
 ```sh
-cd /opt/containers/nvg-tracker
+cd /opt/containers/product-watcher
 docker compose ps
 docker compose logs --tail 50
 docker compose up -d --build --wait
@@ -69,7 +69,7 @@ PY
 Automated tests run with network disabled and isolated temporary databases. The suite now includes Playwright rendering of mocked search/detail pages, listing/fee parsing and access-challenge detection. Tests run with the same read-only/capability restrictions as deployment. They cover multilingual classification/exclusions, exact price threshold and PLN costs, persistent flags, notification deduplication and failure retries, mock Allegro pipeline and denied access, exchange-rate caching, HTML route rendering, Basic authentication, CSRF checks, source IP filtering and authenticated imports.
 
 ```sh
-docker run --rm --network none --read-only --tmpfs /tmp:size=512m --cap-drop ALL --security-opt no-new-privileges -e DATA_DIR=/tmp/test-data -e XDG_CONFIG_HOME=/tmp/chromium-config -e XDG_CACHE_HOME=/tmp/chromium-cache nvg-tracker:local python -m pytest -q -p no:cacheprovider /srv/tests
+docker run --rm --network none --read-only --tmpfs /tmp:size=512m --cap-drop ALL --security-opt no-new-privileges -e DATA_DIR=/tmp/test-data -e XDG_CONFIG_HOME=/tmp/chromium-config -e XDG_CACHE_HOME=/tmp/chromium-cache product-watcher:local python -m pytest -q -p no:cacheprovider /srv/tests
 ```
 
 `tests/mock_marketplaces.json` is exclusively a fixture, not deployed listings. The deployment was additionally checked using a synthetic above-budget import and subsequent cleanup. Live HTTP pages, NBP retrieval, ntfy acceptance, SQLite integrity and container restart/persistence were checked. Desktop (1440px) and mobile (390px) Playwright checks verified all four dashboard pages, no horizontal overflow and no JavaScript errors. Android receipt itself is not verified. The dashboard source statuses are the authority for live source access and recent check results.

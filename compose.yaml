@@ -1,7 +1,7 @@
-name: nvg-tracker
+name: product-watcher
 x-common: &common
   build: .
-  image: nvg-tracker:local
+  image: product-watcher:local
   restart: unless-stopped
   env_file: .env
   environment:
